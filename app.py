@@ -6,6 +6,7 @@ import json
 import os
 from datetime import datetime
 import traceback
+import sys
 
 app = Flask(__name__)
 
@@ -13,24 +14,61 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 app.config['JSON_SORT_KEYS'] = False
 
-# Load models
-print("Loading analytics models...")
-try:
-    performance_model = joblib.load('models/performance_model.pkl')
-    risk_model = joblib.load('models/risk_model.pkl')
-    scaler = joblib.load('models/scaler.pkl')
-    label_encoders = joblib.load('models/label_encoders.pkl')
+# Global variables for models
+performance_model = None
+risk_model = None
+scaler = None
+label_encoders = None
+metadata = {}
+
+def load_models():
+    """Load models with error handling"""
+    global performance_model, risk_model, scaler, label_encoders, metadata
     
-    with open('models/model_metadata.json', 'r') as f:
-        metadata = json.load(f)
-    
-    print("✓ Models loaded successfully!")
-except Exception as e:
-    print(f"✗ Error loading models: {e}")
-    performance_model = None
-    risk_model = None
-    scaler = None
-    metadata = {}
+    try:
+        print("=" * 60)
+        print("Loading analytics models...")
+        print("=" * 60)
+        
+        # Check if models directory exists
+        if not os.path.exists('models'):
+            print("ERROR: models directory not found!")
+            return False
+        
+        # List files in models directory
+        print("\nFiles in models directory:")
+        for file in os.listdir('models'):
+            print(f"  - {file}")
+        
+        # Load models
+        performance_model = joblib.load('models/performance_model.pkl')
+        print("✓ Performance model loaded")
+        
+        risk_model = joblib.load('models/risk_model.pkl')
+        print("✓ Risk model loaded")
+        
+        scaler = joblib.load('models/scaler.pkl')
+        print("✓ Scaler loaded")
+        
+        label_encoders = joblib.load('models/label_encoders.pkl')
+        print("✓ Label encoders loaded")
+        
+        with open('models/model_metadata.json', 'r') as f:
+            metadata = json.load(f)
+        print("✓ Metadata loaded")
+        
+        print("\n" + "=" * 60)
+        print("All models loaded successfully!")
+        print("=" * 60)
+        return True
+        
+    except Exception as e:
+        print(f"\n✗ ERROR loading models: {e}")
+        print(traceback.format_exc())
+        return False
+
+# Load models on startup
+models_loaded = load_models()
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -64,7 +102,11 @@ def analyze_column_semantics(df):
                 column_types[col] = 'numerical_metric'
         else:
             # Categorical column
-            unique_ratio = len(sample_values.unique()) / len(sample_values)
+            if len(sample_values) == 0:
+                column_types[col] = 'unknown'
+                continue
+                
+            unique_ratio = len(sample_values.unique()) / len(sample_values) if len(sample_values) > 0 else 0
             
             if any(keyword in col_lower for keyword in ['dept', 'department', 'division', 'unit']):
                 column_types[col] = 'department'
@@ -86,23 +128,25 @@ def calculate_comprehensive_metrics(df, column_types):
         'overview': {},
         'numerical_summary': {},
         'categorical_summary': {},
-        'trends': {},
         'correlations': []
     }
     
     # Basic overview
     metrics['overview'] = {
-        'total_records': len(df),
-        'total_columns': len(df.columns),
-        'numerical_columns': len(df.select_dtypes(include=[np.number]).columns),
-        'categorical_columns': len(df.select_dtypes(include=['object']).columns),
-        'missing_values': df.isnull().sum().sum(),
-        'duplicate_rows': df.duplicated().sum()
+        'total_records': int(len(df)),
+        'total_columns': int(len(df.columns)),
+        'numerical_columns': int(len(df.select_dtypes(include=[np.number]).columns)),
+        'categorical_columns': int(len(df.select_dtypes(include=['object']).columns)),
+        'missing_values': int(df.isnull().sum().sum()),
+        'duplicate_rows': int(df.duplicated().sum())
     }
     
     # Numerical summary
     numerical_cols = df.select_dtypes(include=[np.number]).columns
     for col in numerical_cols:
+        if df[col].notna().sum() == 0:
+            continue
+            
         metrics['numerical_summary'][col] = {
             'mean': float(df[col].mean()),
             'median': float(df[col].median()),
@@ -116,30 +160,38 @@ def calculate_comprehensive_metrics(df, column_types):
     # Categorical summary
     categorical_cols = df.select_dtypes(include=['object']).columns
     for col in categorical_cols:
+        if df[col].notna().sum() == 0:
+            continue
+            
         value_counts = df[col].value_counts()
+        if len(value_counts) == 0:
+            continue
+            
         metrics['categorical_summary'][col] = {
             'unique_values': int(df[col].nunique()),
-            'most_common': str(value_counts.index[0]) if len(value_counts) > 0 else None,
-            'most_common_count': int(value_counts.iloc[0]) if len(value_counts) > 0 else 0,
-            'distribution': value_counts.head(10).to_dict(),
+            'most_common': str(value_counts.index[0]),
+            'most_common_count': int(value_counts.iloc[0]),
+            'distribution': {str(k): int(v) for k, v in value_counts.head(10).items()},
             'type': column_types.get(col, 'category')
         }
     
     # Calculate correlations for numerical columns
     if len(numerical_cols) > 1:
-        corr_matrix = df[numerical_cols].corr()
-        
-        # Find strong correlations
-        for i in range(len(corr_matrix.columns)):
-            for j in range(i+1, len(corr_matrix.columns)):
-                corr_value = corr_matrix.iloc[i, j]
-                if abs(corr_value) > 0.5:  # Strong correlation
-                    metrics['correlations'].append({
-                        'feature_1': corr_matrix.columns[i],
-                        'feature_2': corr_matrix.columns[j],
-                        'correlation': float(corr_value),
-                        'strength': 'strong' if abs(corr_value) > 0.7 else 'moderate'
-                    })
+        try:
+            corr_matrix = df[numerical_cols].corr()
+            
+            for i in range(len(corr_matrix.columns)):
+                for j in range(i+1, len(corr_matrix.columns)):
+                    corr_value = corr_matrix.iloc[i, j]
+                    if not np.isnan(corr_value) and abs(corr_value) > 0.5:
+                        metrics['correlations'].append({
+                            'feature_1': corr_matrix.columns[i],
+                            'feature_2': corr_matrix.columns[j],
+                            'correlation': float(corr_value),
+                            'strength': 'strong' if abs(corr_value) > 0.7 else 'moderate'
+                        })
+        except:
+            pass
     
     return metrics
 
@@ -148,7 +200,7 @@ def identify_lagging_areas(df, column_types, metrics):
     
     lagging_areas = []
     
-    # Find grouping columns (department, region, etc.)
+    # Find grouping columns
     group_cols = [col for col, type_ in column_types.items() 
                   if type_ in ['department', 'region', 'group', 'category']]
     
@@ -160,14 +212,17 @@ def identify_lagging_areas(df, column_types, metrics):
         return lagging_areas
     
     # Analyze each grouping
-    for group_col in group_cols[:2]:  # Limit to first 2 grouping columns
-        for perf_col in perf_cols[:3]:  # Limit to first 3 performance metrics
+    for group_col in group_cols[:2]:
+        for perf_col in perf_cols[:3]:
             try:
                 grouped = df.groupby(group_col)[perf_col].agg(['mean', 'median', 'count'])
                 overall_mean = df[perf_col].mean()
                 
+                if np.isnan(overall_mean) or overall_mean == 0:
+                    continue
+                
                 # Find groups below average
-                below_avg = grouped[grouped['mean'] < overall_mean * 0.8]  # 20% below average
+                below_avg = grouped[grouped['mean'] < overall_mean * 0.8]
                 
                 for group_name, row in below_avg.iterrows():
                     gap = overall_mean - row['mean']
@@ -184,45 +239,40 @@ def identify_lagging_areas(df, column_types, metrics):
                         'sample_size': int(row['count']),
                         'severity': 'critical' if gap_pct > 30 else 'moderate' if gap_pct > 15 else 'minor'
                     })
-            except Exception as e:
+            except:
                 continue
     
-    # Sort by gap percentage
     lagging_areas.sort(key=lambda x: x['gap_percentage'], reverse=True)
-    
-    return lagging_areas[:10]  # Return top 10
+    return lagging_areas[:10]
 
 def identify_booming_areas(df, column_types, metrics):
     """Identify high-performing areas with growth potential"""
     
     booming_areas = []
     
-    # Find grouping columns
     group_cols = [col for col, type_ in column_types.items() 
                   if type_ in ['department', 'region', 'group', 'category']]
     
-    # Find performance metrics
     perf_cols = [col for col, type_ in column_types.items() 
                  if type_ in ['revenue', 'profit', 'productivity', 'satisfaction', 'growth']]
     
     if not group_cols or not perf_cols:
         return booming_areas
     
-    # Analyze each grouping
     for group_col in group_cols[:2]:
         for perf_col in perf_cols[:3]:
             try:
                 grouped = df.groupby(group_col)[perf_col].agg(['mean', 'median', 'count', 'std'])
                 overall_mean = df[perf_col].mean()
                 
-                # Find groups significantly above average
-                above_avg = grouped[grouped['mean'] > overall_mean * 1.2]  # 20% above average
+                if np.isnan(overall_mean) or overall_mean == 0:
+                    continue
+                
+                above_avg = grouped[grouped['mean'] > overall_mean * 1.2]
                 
                 for group_name, row in above_avg.iterrows():
                     outperformance = row['mean'] - overall_mean
                     outperformance_pct = (outperformance / overall_mean) * 100
-                    
-                    # Check for consistency (lower std relative to mean)
                     cv = (row['std'] / row['mean']) * 100 if row['mean'] != 0 else 100
                     
                     booming_areas.append({
@@ -234,16 +284,13 @@ def identify_booming_areas(df, column_types, metrics):
                         'outperformance': float(outperformance),
                         'outperformance_percentage': float(outperformance_pct),
                         'consistency': 'high' if cv < 20 else 'moderate' if cv < 40 else 'low',
-                        'coefficient_of_variation': float(cv),
                         'sample_size': int(row['count']),
                         'potential': 'excellent' if outperformance_pct > 40 else 'good' if outperformance_pct > 25 else 'fair'
                     })
-            except Exception as e:
+            except:
                 continue
     
-    # Sort by outperformance
     booming_areas.sort(key=lambda x: x['outperformance_percentage'], reverse=True)
-    
     return booming_areas[:10]
 
 def generate_actionable_insights(df, column_types, metrics, lagging, booming):
@@ -256,62 +303,47 @@ def generate_actionable_insights(df, column_types, metrics, lagging, booming):
         'growth_opportunities': []
     }
     
-    # Critical actions for lagging areas
-    for lag in lagging[:3]:  # Top 3 lagging areas
+    # Critical actions
+    for lag in lagging[:3]:
         if lag['severity'] == 'critical':
             insights['critical_actions'].append({
                 'priority': 'HIGH',
                 'area': f"{lag['category']}: {lag['name']}",
                 'issue': f"Performing {lag['gap_percentage']:.1f}% below average in {lag['metric']}",
-                'recommendation': f"Immediate intervention required. Consider: root cause analysis, resource reallocation, or process improvement initiatives.",
-                'expected_impact': f"Potential to recover ${lag['gap']:,.0f} in {lag['metric']}" if 'revenue' in lag['metric'].lower() or 'profit' in lag['metric'].lower() else f"Improve {lag['metric']} by {lag['gap']:.1f} points"
+                'recommendation': f"Immediate intervention required. Consider root cause analysis and resource reallocation.",
+                'expected_impact': f"Potential improvement of {lag['gap']:.2f} in {lag['metric']}"
             })
     
-    # Quick wins from moderate performers
+    # Quick wins
     for lag in lagging[3:6]:
         if lag['severity'] in ['moderate', 'minor']:
             insights['quick_wins'].append({
                 'priority': 'MEDIUM',
                 'area': f"{lag['category']}: {lag['name']}",
                 'opportunity': f"Close {lag['gap_percentage']:.1f}% gap in {lag['metric']}",
-                'recommendation': f"Apply best practices from top performers. Quick process improvements could yield significant results.",
-                'estimated_effort': 'Low to Medium',
+                'recommendation': f"Apply best practices from top performers.",
                 'estimated_timeline': '1-3 months'
             })
     
-    # Growth opportunities from booming areas
+    # Growth opportunities
     for boom in booming[:3]:
         insights['growth_opportunities'].append({
             'priority': 'STRATEGIC',
             'area': f"{boom['category']}: {boom['name']}",
             'strength': f"Outperforming by {boom['outperformance_percentage']:.1f}% in {boom['metric']}",
-            'recommendation': f"Scale successful strategies. Consider: increased investment, expansion, or replicating model to other areas.",
-            'potential_multiplier': f"{boom['outperformance_percentage']/100 + 1:.1f}x",
+            'recommendation': f"Scale successful strategies. Consider expansion.",
             'consistency': boom['consistency']
         })
     
-    # Strategic recommendations based on correlations
+    # Strategic recommendations
     if metrics.get('correlations'):
-        strong_corrs = [c for c in metrics['correlations'] if c['strength'] == 'strong']
-        if strong_corrs:
-            top_corr = strong_corrs[0]
-            insights['strategic_recommendations'].append({
-                'type': 'Leverage Key Relationship',
-                'finding': f"Strong correlation ({top_corr['correlation']:.2f}) between {top_corr['feature_1']} and {top_corr['feature_2']}",
-                'recommendation': f"Focus on improving {top_corr['feature_1']} to positively impact {top_corr['feature_2']}",
-                'confidence': 'High'
-            })
-    
-    # Overall strategic direction
-    if lagging:
-        total_recovery_potential = sum(lag.get('gap', 0) for lag in lagging if 'revenue' in lag.get('metric', '').lower())
-        if total_recovery_potential > 0:
-            insights['strategic_recommendations'].append({
-                'type': 'Revenue Recovery',
-                'finding': f"Total revenue recovery potential: ${total_recovery_potential:,.0f}",
-                'recommendation': "Implement turnaround strategy for underperforming areas with dedicated task force",
-                'priority': 'HIGH'
-            })
+        top_corr = metrics['correlations'][0]
+        insights['strategic_recommendations'].append({
+            'type': 'Leverage Key Relationship',
+            'finding': f"Strong correlation between {top_corr['feature_1']} and {top_corr['feature_2']}",
+            'recommendation': f"Focus on improving {top_corr['feature_1']} to impact {top_corr['feature_2']}",
+            'confidence': 'High'
+        })
     
     return insights
 
@@ -322,16 +354,8 @@ def home():
     return jsonify({
         'service': 'Magadh Business Analytics Engine',
         'version': '2.0.0',
+        'status': 'online' if models_loaded else 'models not loaded',
         'description': 'AI-powered business analytics and insights generation',
-        'capabilities': [
-            'Dynamic CSV analysis (any columns)',
-            'Performance prediction',
-            'Lagging area identification',
-            'Booming sector analysis',
-            'Actionable insights generation',
-            'Correlation analysis',
-            'Risk categorization'
-        ],
         'endpoints': {
             '/': 'API information',
             '/health': 'Health check',
@@ -343,147 +367,103 @@ def home():
 @app.route('/health')
 def health():
     return jsonify({
-        'status': 'healthy',
-        'models_loaded': performance_model is not None,
+        'status': 'healthy' if models_loaded else 'unhealthy',
+        'models_loaded': models_loaded,
         'timestamp': datetime.now().isoformat()
     })
 
 @app.route('/metrics')
 def get_metrics():
-    return jsonify(metadata)
+    if models_loaded:
+        return jsonify(metadata)
+    else:
+        return jsonify({'error': 'Models not loaded'}), 500
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """Main analysis endpoint - accepts CSV data and returns comprehensive insights"""
+    """Main analysis endpoint"""
+    
+    if not models_loaded:
+        return jsonify({'error': 'Models not loaded. Please check server logs.'}), 500
     
     try:
         start_time = datetime.now()
         
-        # Get data from request
+        # Get data
         if 'file' in request.files:
-            # File upload
             file = request.files['file']
             df = pd.read_csv(file)
         elif request.is_json:
-            # JSON data
             data = request.get_json()
             if isinstance(data, list):
                 df = pd.DataFrame(data)
             else:
                 return jsonify({'error': 'JSON data must be a list of objects'}), 400
         else:
-            return jsonify({'error': 'No data provided. Send CSV file or JSON data'}), 400
+            return jsonify({'error': 'No data provided'}), 400
         
-        # Validate data
+        # Validate
         if df.empty:
-            return jsonify({'error': 'Empty dataset provided'}), 400
+            return jsonify({'error': 'Empty dataset'}), 400
         
         if len(df) < 10:
-            return jsonify({'error': 'Dataset too small. Minimum 10 records required'}), 400
+            return jsonify({'error': 'Minimum 10 records required'}), 400
         
-        # Step 1: Analyze column semantics
-        print(f"Analyzing dataset with {len(df)} rows and {len(df.columns)} columns...")
+        # Analyze
+        print(f"Analyzing {len(df)} rows, {len(df.columns)} columns...")
+        
         column_types = analyze_column_semantics(df)
-        
-        # Step 2: Calculate comprehensive metrics
-        print("Calculating metrics...")
         metrics = calculate_comprehensive_metrics(df, column_types)
-        
-        # Step 3: Identify lagging areas
-        print("Identifying lagging areas...")
         lagging_areas = identify_lagging_areas(df, column_types, metrics)
-        
-        # Step 4: Identify booming areas
-        print("Identifying booming areas...")
         booming_areas = identify_booming_areas(df, column_types, metrics)
-        
-        # Step 5: Generate actionable insights
-        print("Generating insights...")
         insights = generate_actionable_insights(df, column_types, metrics, lagging_areas, booming_areas)
         
-        # Step 6: Statistical analysis
-        statistical_summary = {
-            'data_quality': {
-                'completeness': float((1 - df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100),
-                'uniqueness': float((1 - df.duplicated().sum() / len(df)) * 100) if len(df) > 0 else 100,
-                'total_records': len(df),
-                'usable_records': len(df.dropna())
-            },
-            'distribution_analysis': {}
-        }
-        
-        # Analyze distribution of numerical columns
-        numerical_cols = df.select_dtypes(include=[np.number]).columns
-        for col in numerical_cols[:5]:  # Top 5 numerical columns
-            skewness = float(df[col].skew())
-            statistical_summary['distribution_analysis'][col] = {
-                'skewness': skewness,
-                'distribution_type': 'right-skewed' if skewness > 0.5 else 'left-skewed' if skewness < -0.5 else 'normal',
-                'outliers_count': int(((df[col] < df[col].quantile(0.25) - 1.5 * (df[col].quantile(0.75) - df[col].quantile(0.25))) |
-                                       (df[col] > df[col].quantile(0.75) + 1.5 * (df[col].quantile(0.75) - df[col].quantile(0.25)))).sum())
-            }
-        
-        # Calculate processing time
         processing_time = (datetime.now() - start_time).total_seconds()
         
-        # Compile comprehensive response
         response = {
             'analysis_metadata': {
                 'timestamp': datetime.now().isoformat(),
                 'processing_time_seconds': round(processing_time, 2),
                 'dataset_size': len(df),
-                'columns_analyzed': len(df.columns),
-                'analysis_version': '2.0.0'
+                'columns_analyzed': len(df.columns)
             },
             'column_semantics': column_types,
             'metrics': metrics,
-            'statistical_summary': statistical_summary,
             'lagging_areas': {
                 'count': len(lagging_areas),
-                'items': lagging_areas,
-                'summary': f"Found {len(lagging_areas)} underperforming areas requiring attention"
+                'items': lagging_areas
             },
             'booming_areas': {
                 'count': len(booming_areas),
-                'items': booming_areas,
-                'summary': f"Identified {len(booming_areas)} high-performing areas with growth potential"
+                'items': booming_areas
             },
-            'insights': insights,
-            'recommendations_summary': {
-                'critical_actions': len(insights['critical_actions']),
-                'quick_wins': len(insights['quick_wins']),
-                'strategic_recommendations': len(insights['strategic_recommendations']),
-                'growth_opportunities': len(insights['growth_opportunities']),
-                'total_recommendations': sum([
-                    len(insights['critical_actions']),
-                    len(insights['quick_wins']),
-                    len(insights['strategic_recommendations']),
-                    len(insights['growth_opportunities'])
-                ])
-            }
+            'insights': insights
         }
         
-        print(f"✓ Analysis complete in {processing_time:.2f} seconds")
-        
+        print(f"✓ Analysis complete in {processing_time:.2f}s")
         return jsonify(response)
     
     except Exception as e:
-        print(f"✗ Error during analysis: {str(e)}")
+        print(f"✗ Error: {str(e)}")
         print(traceback.format_exc())
-        return jsonify({
-            'error': 'Analysis failed',
-            'message': str(e),
-            'type': type(e).__name__
-        }), 500
+        return jsonify({'error': str(e), 'type': type(e).__name__}), 500
 
 @app.errorhandler(413)
 def too_large(e):
-    return jsonify({'error': 'File too large. Maximum size is 50MB'}), 413
+    return jsonify({'error': 'File too large. Max 50MB'}), 413
 
 @app.errorhandler(500)
 def internal_error(e):
-    return jsonify({'error': 'Internal server error', 'message': str(e)}), 500
+    return jsonify({'error': 'Internal server error'}), 500
 
+# Startup check
 if __name__ == '__main__':
+    if not models_loaded:
+        print("\n" + "="*60)
+        print("WARNING: Models failed to load!")
+        print("The application will start but /analyze will not work.")
+        print("="*60 + "\n")
+    
     port = int(os.environ.get('PORT', 5000))
+    print(f"\nStarting Flask app on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
